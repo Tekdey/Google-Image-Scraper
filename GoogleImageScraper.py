@@ -7,6 +7,7 @@ Created on Sat Jul 18 13:01:02 2020
 #import selenium drivers
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -26,7 +27,7 @@ import re
 import patch
 
 class GoogleImageScraper():
-    def __init__(self, webdriver_path, image_path, search_key="cat", number_of_images=1, headless=True, min_resolution=(0, 0), max_resolution=(1920, 1080), max_missed=10):
+    def __init__(self, webdriver_path, image_path, search_key="cat", number_of_images=1, headless=True, min_resolution=(0, 0), max_resolution=(1920, 1080), max_missed=10, user_data_dir=None, debugger_address=None):
         #check parameter types
         image_path = os.path.join(image_path, search_key)
         if (type(number_of_images)!=int):
@@ -44,12 +45,30 @@ class GoogleImageScraper():
 
         for i in range(1):
             try:
-                #try going to www.google.com
                 options = Options()
-                if(headless):
-                    options.add_argument('--headless')
-                driver = webdriver.Chrome(webdriver_path, chrome_options=options)
-                driver.set_window_size(1400,1050)
+                if debugger_address:
+                    # Attach to an already-running Chrome started with --remote-debugging-port.
+                    # Captcha resolved once manually → session stays warm across many scraper runs.
+                    options.add_experimental_option("debuggerAddress", debugger_address)
+                    driver = webdriver.Chrome(service=Service(webdriver_path), options=options) if os.path.isfile(webdriver_path) else webdriver.Chrome(options=options)
+                else:
+                    if(headless):
+                        options.add_argument('--headless=new')
+                    if user_data_dir:
+                        os.makedirs(user_data_dir, exist_ok=True)
+                        options.add_argument(f"--user-data-dir={user_data_dir}")
+                    options.add_argument("--disable-blink-features=AutomationControlled")
+                    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+                    options.add_experimental_option("useAutomationExtension", False)
+                    options.add_argument("--no-sandbox")
+                    options.add_argument("--disable-dev-shm-usage")
+                    options.add_argument("--lang=fr-FR")
+                    options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36")
+                    driver = webdriver.Chrome(service=Service(webdriver_path), options=options) if os.path.isfile(webdriver_path) else webdriver.Chrome(options=options)
+                    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+                        "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+                    })
+                    driver.set_window_size(1400,1050)
                 driver.get("https://www.google.com")
                 try:
                     WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.ID, "W0wltc"))).click()
@@ -64,6 +83,7 @@ class GoogleImageScraper():
                     exit("[ERR] Please update the chromedriver.exe in the webdriver folder according to your chrome version:https://chromedriver.chromium.org/downloads")
 
         self.driver = driver
+        self.owns_driver = not debugger_address  # only quit Chrome if we launched it ourselves
         self.search_key = search_key
         self.number_of_images = number_of_images
         self.webdriver_path = webdriver_path
@@ -126,19 +146,35 @@ class GoogleImageScraper():
             try:
                 #select image from the popup
                 time.sleep(1)
-                class_names = ["n3VNCb","iPVvYb","r48jcc","pT0Scc","H8Rx8c"]
-                images = [self.driver.find_elements(By.CLASS_NAME, class_name) for class_name in class_names if len(self.driver.find_elements(By.CLASS_NAME, class_name)) != 0 ][0]
-                for image in images:
-                    #only download images that starts with http
-                    src_link = image.get_attribute("src")
-                    if(("http" in src_link) and (not "encrypted" in src_link)):
-                        print(
-                            f"[INFO] {self.search_key} \t #{count} \t {src_link}")
-                        image_urls.append(src_link)
-                        count +=1
+                found = False
+                # Try legacy class names first, then fall back to any <img> with an http src that isn't a Google-thumbnail CDN url.
+                class_names = ["n3VNCb","iPVvYb","r48jcc","pT0Scc","H8Rx8c","sFlh5c","FyHeAf","iPVvYb"]
+                candidate_lists = [self.driver.find_elements(By.CLASS_NAME, c) for c in class_names]
+                candidate_lists = [lst for lst in candidate_lists if lst]
+                if not candidate_lists:
+                    candidate_lists = [self.driver.find_elements(By.TAG_NAME, "img")]
+                for images in candidate_lists:
+                    for image in images:
+                        src_link = image.get_attribute("src") or ""
+                        if src_link.startswith("http") and "encrypted-tbn" not in src_link and "gstatic.com" not in src_link:
+                            print(f"[INFO] {self.search_key} \t #{count} \t {src_link}")
+                            image_urls.append(src_link)
+                            count += 1
+                            found = True
+                            break
+                    if found:
                         break
-            except Exception:
-                print("[INFO] Unable to get link")
+                if not found:
+                    print("[INFO] Unable to get link")
+                    try:
+                        debug_path = os.path.join(self.image_path, f"_debug_page_{missed_count}.html")
+                        with open(debug_path, "w", encoding="utf-8") as f:
+                            f.write(self.driver.page_source)
+                        print(f"[DEBUG] page source dumped to {debug_path}")
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[INFO] Unable to get link: {e}")
 
             try:
                 #scroll page to load next image
@@ -153,7 +189,8 @@ class GoogleImageScraper():
 
 
 
-        self.driver.quit()
+        if self.owns_driver:
+            self.driver.quit()
         print("[INFO] Google search ended")
         return image_urls
 
